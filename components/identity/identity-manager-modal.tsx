@@ -7,23 +7,18 @@ import { Button } from '@/components/ui/button';
 import { IconButton } from '@/components/ui/icon-button';
 import { Dialog } from '@/components/ui/dialog';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
-import { IdentityForm } from './identity-form';
+import { IdentityForm, type IdentityFormData } from './identity-form';
 import {
   useIdentityStore, createIdentityWithHooks, updateIdentityWithHooks, deleteIdentityWithHooks,
 } from '@/stores/identity-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAccountStore } from '@/stores/account-store';
 import { useSettingsStore } from '@/stores/settings-store';
-
-function useSyncIdentities() {
-  const syncIdentities = useAuthStore((state) => state.syncIdentities);
-  return syncIdentities;
-}
-
-function useRefreshIdentities() {
-  return useAuthStore((state) => state.refreshIdentities);
-}
-import type { Identity, EmailAddress } from '@/lib/jmap/types';
+import {
+  removeExtendedSignature,
+  upsertExtendedSignature,
+} from '@/lib/extended-signatures';
+import type { Identity } from '@/lib/jmap/types';
 import { toast } from '@/stores/toast-store';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import { useDiscardChanges } from '@/components/settings/use-discard-changes';
@@ -31,13 +26,31 @@ import { toUnicodeEmail } from '@/lib/idn';
 import { sortIdentities } from '@/lib/identity-order';
 import { useRestriction } from '@/hooks/use-restriction';
 
-interface IdentityFormData {
-  name: string;
-  email: string;
-  replyTo?: EmailAddress[] | null;
-  bcc?: EmailAddress[] | null;
-  textSignature?: string | null;
-  htmlSignature?: string | null;
+function useSyncIdentities() {
+  return useAuthStore((state) => state.syncIdentities);
+}
+
+function useRefreshIdentities() {
+  return useAuthStore((state) => state.refreshIdentities);
+}
+
+function persistExtendedSignature(identityId: string, data: IdentityFormData) {
+  // Left out when the organisation locked or hid the signature: keep it as it is.
+  if (data.extendedSignatureHtml === undefined) return;
+  const accountId = useAccountStore.getState().activeAccountId;
+  if (!accountId) return;
+  const current = useSettingsStore.getState().extendedSignatures;
+  if (data.extendedSignatureHtml) {
+    useSettingsStore.getState().updateSetting(
+      'extendedSignatures',
+      upsertExtendedSignature(current, accountId, identityId, data.extendedSignatureHtml),
+    );
+  } else {
+    useSettingsStore.getState().updateSetting(
+      'extendedSignatures',
+      removeExtendedSignature(current, accountId, identityId),
+    );
+  }
 }
 
 interface IdentityManagerModalProps {
@@ -151,6 +164,7 @@ export function IdentityManagerModal({ isOpen, onClose }: IdentityManagerModalPr
       });
       if (!saved) return;
 
+      persistExtendedSignature(identity.id, data);
       await refreshIdentities();
       setEditingId(null);
       toast.success(tNotif('identity_updated'));
@@ -180,6 +194,14 @@ export function IdentityManagerModal({ isOpen, onClose }: IdentityManagerModalPr
 
     try {
       if (!(await deleteIdentityWithHooks(client, identity))) return;
+      const accountId = useAccountStore.getState().activeAccountId;
+      if (accountId) {
+        const current = useSettingsStore.getState().extendedSignatures;
+        useSettingsStore.getState().updateSetting(
+          'extendedSignatures',
+          removeExtendedSignature(current, accountId, identity.id),
+        );
+      }
       await refreshIdentities();
       toast.success(tNotif('identity_deleted'));
     } catch (error) {

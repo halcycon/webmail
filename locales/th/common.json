@@ -815,7 +815,17 @@
       "save": "บันทึกข้อมูลประจำตัว",
       "cancel": "ยกเลิก",
       "creating": "กำลังสร้าง...",
-      "updating": "กำลังอัปเดต..."
+      "updating": "กำลังอัปเดต...",
+      "insert_image": "Insert image",
+      "uploading_image": "Uploading…",
+      "image_help": "Images are stored by Bulwark and embedded in outgoing mail (not hosted publicly). Save the identity first, then insert images.",
+      "image_requires_saved_identity": "Save the identity first, then edit it to add images.",
+      "image_storage_unavailable": "Signature image storage is unavailable. Ensure SESSION_SECRET is configured.",
+      "image_type_rejected": "Unsupported image type. Use JPEG, PNG, GIF, or WebP.",
+      "image_too_large": "Image is too large (max {maxMb} MiB).",
+      "image_too_many": "A signature may include at most {max} images.",
+      "image_upload_failed": "Failed to upload signature image.",
+      "image_assets_note": "{count, plural, one {# embedded image (stored separately from the mail server signature limit)} other {# embedded images (stored separately from the mail server signature limit)}}"
     },
     "sub_address": {
       "button_tooltip": "ใช้ที่อยู่ย่อย (Sub-address)",
@@ -1232,7 +1242,8 @@
     "reply_all_to": "ตอบกลับทั้งหมด",
     "reply_to": "ตอบกลับ",
     "send": "ส่ง",
-    "signature_edit_hint": "ดับเบิลคลิกเพื่อแก้ไขลายเซ็น"
+    "signature_edit_hint": "ดับเบิลคลิกเพื่อแก้ไขลายเซ็น",
+    "signature_image_load_failed": "Could not load one image from this signature. The message can still be sent without that image."
   },
   "email_viewer": {
     "read_receipt": {

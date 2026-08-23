@@ -145,6 +145,13 @@ import { fileStorage } from "@/lib/plugin-storage";
 import { usePolicyStore } from "@/stores/policy-store";
 import { registerComposeFlush } from "@/lib/compose-flush-registry";
 import { toUnicodeEmail } from "@/lib/idn";
+import { rewriteInlineImagesHtml, type InlineImage } from "@/lib/inline-images";
+import {
+  getEffectiveHtmlSignature,
+  resolveSignatureAssetsForCompose,
+  htmlHasSignatureAssets,
+} from "@/lib/resolve-signature-for-compose";
+import { getExtendedSignature } from "@/lib/extended-signatures";
 
 /**
  * Derives the text/plain alternative from the composer's HTML body, preserving
@@ -496,6 +503,9 @@ export function EmailComposer({
   const sendDelaySeconds = useSettingsStore((state) => state.sendDelaySeconds);
   const signaturePosition = useSettingsStore((state) => state.signaturePosition);
   const signatureSeparatorEnabled = useSettingsStore((state) => state.signatureSeparatorEnabled);
+  const extendedSignatures = useSettingsStore((state) => state.extendedSignatures);
+  const username = useAuthStore((state) => state.username);
+  const serverUrl = useAuthStore((state) => state.serverUrl);
   const requestReadReceiptDefault = useSettingsStore((state) => state.requestReadReceiptDefault);
   // A draft belongs to the account the composer was opened in. Switching
   // accounts with the composer open must not move it: its saves would land in
@@ -557,10 +567,24 @@ export function EmailComposer({
   const initialCurrentIdentityForSig = initialData?.selectedIdentityId
     ? identities.find((i) => i.id === initialData.selectedIdentityId) || primaryIdentity
     : primaryIdentity;
+  const initialAccountId = useAccountStore.getState().activeAccountId;
+  const initialExtendedHtml = initialCurrentIdentityForSig?.id && initialAccountId
+    ? getExtendedSignature(
+        useSettingsStore.getState().extendedSignatures,
+        initialAccountId,
+        initialCurrentIdentityForSig.id,
+      )?.html
+    : undefined;
   // The organisation signature applies here as below (hooks/use-org-signature.ts).
   const initialSignatureIdentity = useOrgSignatureIdentity(
-    (initialCurrentIdentityForSig?.htmlSignature || initialCurrentIdentityForSig?.textSignature)
-      ? initialCurrentIdentityForSig
+    (
+      initialCurrentIdentityForSig?.htmlSignature
+      || initialCurrentIdentityForSig?.textSignature
+      || initialExtendedHtml
+    )
+      ? (initialExtendedHtml
+          ? { ...initialCurrentIdentityForSig!, htmlSignature: initialExtendedHtml }
+          : initialCurrentIdentityForSig)
       : primaryIdentity,
     initialCurrentIdentityForSig,
     (initialCurrentIdentityForSig?.id && stripCrossAccountIdentityPrefix(initialCurrentIdentityForSig.id).localAccountId)
@@ -944,7 +968,10 @@ export function EmailComposer({
   });
   // uploadedAt is set for images uploaded from this composer, whose blobId
   // expires (see refreshStaleInlineUploads).
-  const inlineImagesRef = useRef<Array<{ cid: string; blobId: string; type: string; name: string; size: number; dataUrl: string; sourceAccountId?: string; uploadedAt?: number }>>([]);
+  const inlineImagesRef = useRef<InlineImage[]>([]);
+  const signatureAssetIdsRef = useRef<Set<string>>(new Set());
+  const [signatureAssetWarning, setSignatureAssetWarning] = useState(false);
+  const [signaturePreviewHtml, setSignaturePreviewHtml] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [validationErrors, setValidationErrors] = useState<{ to?: boolean; body?: boolean }>({});
   const [shakeField, setShakeField] = useState<string | null>(null);
@@ -1144,10 +1171,33 @@ export function EmailComposer({
   // identity's signature so replies (which auto-select a matching alias) still
   // populate the user's signature. An identity the user picked by hand keeps
   // its own, also an empty one: switching to a team address without a
-  // signature sent the team mail with the personal signature.
-  const ownSignatureIdentity = identityPickedByUser || currentIdentity?.htmlSignature || currentIdentity?.textSignature
-    ? currentIdentity
-    : primaryIdentity;
+  // signature sent the team mail with the personal signature. Bulwark
+  // extended HTML (with image asset refs) is preferred over the JMAP
+  // Identity.htmlSignature fallback when present.
+  const signatureIdentityBase = useMemo(() => {
+    const hasSig = (identity: typeof currentIdentity) => {
+      if (!identity) return false;
+      if (identity.htmlSignature || identity.textSignature) return true;
+      if (identity.id && activeAccountId) {
+        return !!getExtendedSignature(extendedSignatures, activeAccountId, identity.id)?.html?.trim();
+      }
+      return false;
+    };
+    return identityPickedByUser || hasSig(currentIdentity) ? currentIdentity : primaryIdentity;
+  }, [identityPickedByUser, currentIdentity, primaryIdentity, activeAccountId, extendedSignatures]);
+
+  const ownSignatureIdentity = useMemo(() => {
+    if (!signatureIdentityBase) return signatureIdentityBase;
+    const html = getEffectiveHtmlSignature(
+      signatureIdentityBase,
+      activeAccountId,
+      extendedSignatures,
+    );
+    if (!html || html === signatureIdentityBase.htmlSignature) {
+      return signatureIdentityBase;
+    }
+    return { ...signatureIdentityBase, htmlSignature: html };
+  }, [signatureIdentityBase, activeAccountId, extendedSignatures]);
   // Then the organisation signature: the default for an identity without
   // one, or in place of every signature when the admin locked it. Plugins
   // may rewrite the result (onSignatureRender), except a locked one.
@@ -1237,6 +1287,98 @@ export function EmailComposer({
     // signature into the live editor.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signatureIdentity?.id, signatureContent, signatureSeparatorEnabled, signaturePosition, mode, plainTextMode, pluginSignatureRevision]);
+
+  // Hydrate Bulwark signature assets embedded in the composer body (or that
+  // will be appended at send time for below-quote replies). Uploads through
+  // the same inline-image pipeline as manually inserted composer images.
+  useEffect(() => {
+    if (plainTextMode) return;
+    if (!composerClient || !username || !serverUrl) return;
+    const html = signatureIdentity?.htmlSignature;
+    if (!htmlHasSignatureAssets(html)) {
+      setSignatureAssetWarning(false);
+      setSignaturePreviewHtml(null);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      // Drop previous signature-sourced registrations before resolving the new set.
+      inlineImagesRef.current = inlineImagesRef.current.filter((img) => !img.signatureAssetId);
+      signatureAssetIdsRef.current = new Set();
+
+      const result = await resolveSignatureAssetsForCompose({
+        html: html!,
+        username,
+        serverUrl,
+        uploadBlob: (file) => composerClient.uploadBlob(file),
+      });
+      if (cancelled) return;
+
+      for (const image of result.images) {
+        if (!inlineImagesRef.current.some((e) => e.cid === image.cid)) {
+          inlineImagesRef.current.push(image);
+        }
+        if (image.signatureAssetId) {
+          signatureAssetIdsRef.current.add(image.signatureAssetId);
+        }
+      }
+      setSignatureAssetWarning(result.failedAssetIds.length > 0);
+      if (result.images.length > 0) {
+        setSignaturePreviewHtml(result.html);
+      } else if (result.failedAssetIds.length > 0) {
+        setSignaturePreviewHtml(result.html);
+      }
+
+      // Swap placeholders inside an already-embedded signature block.
+      const updates = new Map<string, string>();
+      for (const image of result.images) {
+        updates.set(image.cid, image.dataUrl);
+      }
+
+      const applyResolvedHtml = (prev: string): string => {
+        if (!prev.includes('data-signature-asset')) {
+          // Body may already have been rewritten to data-cid only.
+          return replaceInlineImagePlaceholders(prev, updates);
+        }
+        // Replace asset markers with resolved data URL + data-cid markup.
+        const doc = new DOMParser().parseFromString(`<body>${prev}</body>`, 'text/html');
+        for (const image of result.images) {
+          if (!image.signatureAssetId) continue;
+          doc.querySelectorAll(`img[data-signature-asset="${image.signatureAssetId}"]`).forEach((img) => {
+            img.setAttribute('src', image.dataUrl);
+            img.setAttribute('data-cid', image.cid);
+          });
+        }
+        for (const failedId of result.failedAssetIds) {
+          doc.querySelectorAll(`img[data-signature-asset="${failedId}"]`).forEach((img) => img.remove());
+        }
+        return doc.body.innerHTML;
+      };
+
+      setBody((prev) => applyResolvedHtml(prev));
+
+      const editor = editorRef.current;
+      if (editor) {
+        const current = serializeEditorContent(editor);
+        const next = applyResolvedHtml(current);
+        if (next !== current) {
+          editor.commands.setContent(next, { emitUpdate: true });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    composerClient,
+    plainTextMode,
+    username,
+    serverUrl,
+    signatureIdentity?.id,
+    signatureIdentity?.htmlSignature,
+  ]);
 
   const openScheduleDialog = useCallback(() => {
     setShowScheduleDialog(true);
@@ -1479,11 +1621,13 @@ export function EmailComposer({
     useEffect(() => { processEnrichment(cc, setCc); }, [cc]);
     useEffect(() => { processEnrichment(bcc, setBcc); }, [bcc]);
 
-  const composerSignatureHtml = signatureIdentity?.htmlSignature
-    ? `<div>${sanitizeSignatureHtmlForDisplay(signatureIdentity.htmlSignature)}</div>`
-    : signatureIdentity?.textSignature
-      ? `<div>${getPlainTextSignature(signatureIdentity).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')}</div>`
-      : '';
+  const composerSignatureHtml = signaturePreviewHtml
+    ? `<div>${sanitizeSignatureHtmlForDisplay(signaturePreviewHtml)}</div>`
+    : signatureIdentity?.htmlSignature
+      ? `<div>${sanitizeSignatureHtmlForDisplay(signatureIdentity.htmlSignature)}</div>`
+      : signatureIdentity?.textSignature
+        ? `<div>${getPlainTextSignature(signatureIdentity).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')}</div>`
+        : '';
 
   // Whether the body the user is editing already carries the signature, so the
   // send and draft-save paths must not append a second copy.
@@ -2507,12 +2651,19 @@ export function EmailComposer({
     // below the editor - was saved without it (#823). Embed the *marked-up*
     // form so re-opening the draft round-trips the signature as one block and
     // signatureAlreadyInBody sees it instead of appending a second copy.
+    // Prefer the already-resolved signature HTML (data URLs + data-cid) when
+    // Bulwark signature assets were hydrated for this identity.
     const draftSignatureHtml = signatureAlreadyInBody
       ? ''
-      : buildEmbeddedSignatureHtml(signatureIdentity, {
-          embed: true,
-          separator: signatureSeparatorEnabled,
-        });
+      : signaturePreviewHtml
+        ? buildEmbeddedSignatureHtml(
+            { ...signatureIdentity, htmlSignature: signaturePreviewHtml },
+            { embed: true, separator: signatureSeparatorEnabled },
+          )
+        : buildEmbeddedSignatureHtml(signatureIdentity, {
+            embed: true,
+            separator: signatureSeparatorEnabled,
+          });
     const draftHtmlBody = plainTextMode ? undefined : `${body}${draftSignatureHtml}`;
     const draftTextBody = plainTextMode
       ? (signatureAlreadyInBody
@@ -3069,46 +3220,8 @@ export function EmailComposer({
 
   // Rewrite data: URLs of dropped images (tagged with data-cid) into cid:
   // references so recipient clients that strip data URIs can still render them.
-  const rewriteInlineImages = (html: string): {
-    html: string;
-    attachments: Array<{ blobId: string; name: string; type: string; size: number; disposition: 'inline'; cid: string }>;
-  } => {
-    const known = inlineImagesRef.current;
-    const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
-    const used = new Map<string, typeof known[number]>();
-
-    if (known.length > 0) {
-      doc.querySelectorAll('img[data-cid]').forEach((img) => {
-        const cid = img.getAttribute('data-cid');
-        if (!cid) return;
-        const entry = known.find((e) => e.cid === cid);
-        if (!entry) return;
-        img.setAttribute('src', `cid:${cid}`);
-        img.removeAttribute('data-cid');
-        used.set(cid, entry);
-      });
-    }
-
-    // Recipient mail clients apply default <p> margins inside table cells,
-    // inflating row height. Tiptap wraps cell text in <p>, so force margin:0
-    // to match the composer's tight rows.
-    doc.querySelectorAll('td > p, th > p').forEach((p) => {
-      const existing = p.getAttribute('style') || '';
-      p.setAttribute('style', `margin:0;${existing}`);
-    });
-
-    return {
-      html: doc.body.innerHTML,
-      attachments: Array.from(used.values()).map((e) => ({
-        blobId: e.blobId,
-        name: e.name,
-        type: e.type,
-        size: e.size,
-        disposition: 'inline' as const,
-        cid: e.cid,
-      })),
-    };
-  };
+  const rewriteInlineImages = (html: string) =>
+    rewriteInlineImagesHtml(html, inlineImagesRef.current);
 
   // Guard against double-submit. Rapid Send clicks (or a click racing the
   // keyboard shortcut) used to invoke handleSend once per click before the
@@ -3384,12 +3497,33 @@ export function EmailComposer({
     // above-quote replies, a re-opened draft) `signatureAlreadyInBody` is set
     // and the trailing append below is skipped so we don't duplicate it.
 
-    // Build HTML signature block (used only in rich text mode)
+    // Build HTML signature block (used only in rich text mode). When the
+    // signature was not embedded in the editor (below-quote replies), resolve
+    // Bulwark asset markers to cid: using the already-uploaded inline images.
     const buildSignatureHtml = (): string => {
       if (signatureAlreadyInBody) return '';
       const sep = wantsSignatureSeparator(signatureSeparatorEnabled, signatureIdentity) ? `<br><br>-- <br>` : `<br><br>`;
       if (signatureIdentity?.htmlSignature) {
-        return `${sep}${sanitizeSignatureHtml(signatureIdentity.htmlSignature)}`;
+        let html = sanitizeSignatureHtml(signatureIdentity.htmlSignature);
+        if (htmlHasSignatureAssets(html) || html.includes('data-cid')) {
+          const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
+          doc.querySelectorAll('img[data-signature-asset], img[data-cid]').forEach((img) => {
+            const assetId = img.getAttribute('data-signature-asset');
+            const existingCid = img.getAttribute('data-cid');
+            const entry = inlineImagesRef.current.find((e) =>
+              (assetId && e.signatureAssetId === assetId) || (existingCid && e.cid === existingCid),
+            );
+            if (!entry) {
+              img.remove();
+              return;
+            }
+            img.setAttribute('src', `cid:${entry.cid}`);
+            img.removeAttribute('data-cid');
+            img.removeAttribute('data-signature-asset');
+          });
+          html = doc.body.innerHTML;
+        }
+        return `${sep}${html}`;
       }
       if (signatureIdentity?.textSignature) {
         return `${sep}${signatureIdentity.textSignature.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')}`;
@@ -3410,6 +3544,12 @@ export function EmailComposer({
     // that holds the original message.
     try {
       const inlineCids = plainTextMode ? undefined : bodyInlineCids(body);
+      // A signature appended below (not embedded) is not in the body.
+      if (inlineCids && !signatureAlreadyInBody) {
+        for (const img of inlineImagesRef.current) {
+          if (img.signatureAssetId) inlineCids.add(img.cid);
+        }
+      }
       await rehomeForeignBlobs(inlineCids);
       if (inlineCids?.size) await refreshStaleInlineUploads(inlineCids);
     } catch (error) {
@@ -3422,16 +3562,36 @@ export function EmailComposer({
     }
 
     const rewritten = plainTextMode ? null : rewriteInlineImages(body);
+    const signatureHtml = plainTextMode ? '' : buildSignatureHtml();
     // What the send-pipeline finalisers add (organisation signature) goes in
     // here, on the send only: drafts never get it. The `last` stage (the
     // disclaimer) runs on what goes out once plugins had their say, below.
     const { html: finalHtmlBody, text: finalBody } = finalizeOutgoing({
-      html: plainTextMode ? undefined : `<div>${rewritten!.html}</div>${buildSignatureHtml()}`,
+      html: plainTextMode ? undefined : `<div>${rewritten!.html}</div>${signatureHtml}`,
       text: builtTextBody,
     }, outgoingContext);
     const lastStage = (html: string | undefined, text: string) =>
       finalizeOutgoing({ html: html || undefined, text }, outgoingContext, 'last');
+
+    // Attachments from the body rewrite, plus any signature-sourced inline
+    // images referenced only in the appended signature HTML.
     const inlineAttachments = rewritten?.attachments ?? [];
+    if (signatureHtml) {
+      const seen = new Set(inlineAttachments.map((a) => a.cid));
+      for (const img of inlineImagesRef.current) {
+        if (!img.signatureAssetId || seen.has(img.cid)) continue;
+        if (!signatureHtml.includes(`cid:${img.cid}`)) continue;
+        inlineAttachments.push({
+          blobId: img.blobId,
+          name: img.name,
+          type: img.type,
+          size: img.size,
+          disposition: 'inline',
+          cid: img.cid,
+        });
+        seen.add(img.cid);
+      }
+    }
 
     try {
       const effectiveDelayedUntil = await resolveDelayedUntil(delayedUntil);
@@ -4407,10 +4567,16 @@ export function EmailComposer({
             </div>
           ) : null
         ) : composerSignatureHtml ? (
-          <div
-            className="px-4 pb-3 text-sm leading-6 text-foreground break-words [&_a]:text-primary [&_a]:underline-offset-2 [&_a:hover]:underline"
-            dangerouslySetInnerHTML={{ __html: `${wantsSignatureSeparator(signatureSeparatorEnabled, signatureIdentity) ? '<div>-- </div>' : ''}${composerSignatureHtml}` }}
-          />
+          <div className="px-4 pb-3 text-sm leading-6 text-foreground break-words [&_a]:text-primary [&_a]:underline-offset-2 [&_a:hover]:underline">
+            {signatureAssetWarning && (
+              <p className="text-xs text-amber-600 dark:text-amber-400 mb-2" role="status">
+                {t('signature_image_load_failed')}
+              </p>
+            )}
+            <div
+              dangerouslySetInnerHTML={{ __html: `${wantsSignatureSeparator(signatureSeparatorEnabled, signatureIdentity) ? '<div>-- </div>' : ''}${composerSignatureHtml}` }}
+            />
+          </div>
         ) : null}
         {/* The admin's disclaimer: added on send (lib/org/outgoing.ts), never part of the body. */}
         <OrgDisclaimerPreview sending={currentIdentity} accountId={composingAccountId} plainText={plainTextMode} body={body} />

@@ -995,7 +995,8 @@
     "pop_out": "在獨立視窗中開啟回覆",
     "send_guard_failed": "未傳送 - 傳送前檢查郵件的外掛程式發生錯誤或沒有回應。",
     "cut": "剪下",
-    "copy": "複製"
+    "copy": "複製",
+    "signature_image_load_failed": "Could not load one image from this signature. The message can still be sent without that image."
   },
   "confirm_dialog": {
     "confirm": "確認",
@@ -3195,7 +3196,17 @@
       "save": "儲存寄件身分",
       "cancel": "取消",
       "creating": "正在建立…",
-      "updating": "正在更新…"
+      "updating": "正在更新…",
+      "insert_image": "Insert image",
+      "uploading_image": "Uploading…",
+      "image_help": "Images are stored by Bulwark and embedded in outgoing mail (not hosted publicly). Save the identity first, then insert images.",
+      "image_requires_saved_identity": "Save the identity first, then edit it to add images.",
+      "image_storage_unavailable": "Signature image storage is unavailable. Ensure SESSION_SECRET is configured.",
+      "image_type_rejected": "Unsupported image type. Use JPEG, PNG, GIF, or WebP.",
+      "image_too_large": "Image is too large (max {maxMb} MiB).",
+      "image_too_many": "A signature may include at most {max} images.",
+      "image_upload_failed": "Failed to upload signature image.",
+      "image_assets_note": "{count, plural, one {# embedded image (stored separately from the mail server signature limit)} other {# embedded images (stored separately from the mail server signature limit)}}"
     },
     "sub_address": {
       "button_tooltip": "使用子地址",

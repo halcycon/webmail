@@ -995,7 +995,8 @@
     "pop_out": "답장을 별도 창에서 열기",
     "send_guard_failed": "보내지 않았습니다 - 보내기 전에 메시지를 확인하는 플러그인이 실패했거나 응답하지 않았습니다.",
     "cut": "잘라내기",
-    "copy": "복사"
+    "copy": "복사",
+    "signature_image_load_failed": "Could not load one image from this signature. The message can still be sent without that image."
   },
   "confirm_dialog": {
     "confirm": "확인",
@@ -3195,7 +3196,17 @@
       "save": "저장",
       "cancel": "취소",
       "creating": "만드는 중...",
-      "updating": "업데이트 중..."
+      "updating": "업데이트 중...",
+      "insert_image": "Insert image",
+      "uploading_image": "Uploading…",
+      "image_help": "Images are stored by Bulwark and embedded in outgoing mail (not hosted publicly). Save the identity first, then insert images.",
+      "image_requires_saved_identity": "Save the identity first, then edit it to add images.",
+      "image_storage_unavailable": "Signature image storage is unavailable. Ensure SESSION_SECRET is configured.",
+      "image_type_rejected": "Unsupported image type. Use JPEG, PNG, GIF, or WebP.",
+      "image_too_large": "Image is too large (max {maxMb} MiB).",
+      "image_too_many": "A signature may include at most {max} images.",
+      "image_upload_failed": "Failed to upload signature image.",
+      "image_assets_note": "{count, plural, one {# embedded image (stored separately from the mail server signature limit)} other {# embedded images (stored separately from the mail server signature limit)}}"
     },
     "sub_address": {
       "button_tooltip": "서브 어드레스 사용",
