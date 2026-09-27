@@ -1,0 +1,127 @@
+# Keeps the `custom` branch (upstream + local features) current with
+# bulwarkmail/webmail and publishes ghcr.io/<owner>/webmail-custom.
+#
+# Daily: merge upstream/main into `custom`. Conflicts limited to locale JSON
+# are resolved by key (scripts/custom/merge-locales.mjs); anything else fails
+# the run so it can be merged by hand. The merge is only pushed after the
+# typecheck and unit tests pass, then the image build is dispatched through the
+# upstream docker-publish.yml (which names the image after the branch).
+#
+# Scheduled runs only fire from the default branch, so `custom` must be the
+# fork's default branch. The default token cannot push commits that touch
+# .github/workflows/, which upstream merges sometimes do: set a SYNC_TOKEN
+# secret (fine-grained PAT, Contents + Workflows read/write on this repo).
+# After resolving a conflict by hand, push and run this workflow manually to
+# build the image.
+name: Sync upstream into custom
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: custom-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  UPSTREAM_URL: https://github.com/bulwarkmail/webmail.git
+  BRANCH: custom
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "$UPSTREAM_URL" main:refs/remotes/upstream/main
+          upstream_sha=$(git rev-parse --short upstream/main)
+          echo "upstream=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already contains upstream $upstream_sha"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base=$(git merge-base HEAD upstream/main)
+          msg="Merge upstream $upstream_sha into $BRANCH"
+          if git merge --no-edit -m "$msg" upstream/main; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
+          code_conflicts=$(printf '%s\n' "${conflicted[@]}" | grep -Ev '^locales/[^/]+/[^/]+\.json$' || true)
+          if [ -z "$code_conflicts" ] \
+            && node scripts/custom/merge-locales.mjs "$base" HEAD upstream/main "${conflicted[@]}"; then
+            git add -- "${conflicted[@]}"
+            git commit --no-edit -m "$msg"
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git merge --abort
+          {
+            echo "## Upstream $upstream_sha does not merge cleanly into \`$BRANCH\`"
+            echo
+            echo "Conflicted files:"
+            printf -- '- `%s`\n' "${conflicted[@]}"
+            echo
+            echo "Resolve locally:"
+            echo
+            echo '```bash'
+            echo "git switch $BRANCH && git pull"
+            echo "git fetch origin   # origin = bulwarkmail/webmail"
+            echo "git merge origin/main"
+            echo "# locale files: node scripts/custom/merge-locales.mjs \$(git merge-base HEAD origin/main) HEAD origin/main <files>"
+            echo "git push fork $BRANCH"
+            echo "gh workflow run custom-sync.yml --repo $GITHUB_REPOSITORY --ref $BRANCH"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Upstream $upstream_sha conflicts with $BRANCH; see the run summary."
+          exit 1
+
+      - name: Set up Node
+        if: steps.merge.outputs.merged == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.merge.outputs.merged == 'true'
+        run: npm ci
+
+      - name: Typecheck
+        if: steps.merge.outputs.merged == 'true'
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        if: steps.merge.outputs.merged == 'true'
+        run: npx vitest run --pool=forks --maxWorkers=2 --testTimeout=15000
+
+      - name: Push merge
+        if: steps.merge.outputs.merged == 'true'
+        run: git push origin "HEAD:$BRANCH"
+
+      - name: Build image
+        if: steps.merge.outputs.merged == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker-publish.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
