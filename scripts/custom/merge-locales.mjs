@@ -5,9 +5,11 @@
 //
 // Starts from the `theirs` document (its key order and line endings win) and
 // re-applies every leaf that `ours` added or changed relative to `base`.
+// When joining the conflict blocks in the work-tree file gives the same
+// document, that is written instead, so the file keeps its formatting.
 // Writes each file in place; exits 1 if a key was changed on both sides.
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 
 const [baseRev, oursRev, theirsRev, ...files] = process.argv.slice(2);
 if (!baseRev || !oursRev || !theirsRev || files.length === 0) {
@@ -24,6 +26,23 @@ const show = (rev, file) => {
 };
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const canonical = (v) => JSON.stringify(v, (_, x) => (isObj(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : 1))) : x));
+
+// Keeps the file's own formatting: each conflict block becomes ours then
+// theirs, joined by a comma. Only right when both sides appended keys to the
+// same object, so the caller checks the result against the by-key merge.
+function unionConflictBlocks(text, eol) {
+  if (!text.includes('<<<<<<< ')) return null;
+  return text.replace(
+    /^<<<<<<< [^\n]*\n([\s\S]*?)^(?:\|\|\|\|\|\|\| [^\n]*\n[\s\S]*?)?^=======\r?\n([\s\S]*?)^>>>>>>> [^\n]*\n/gm,
+    (_, ours, theirs) => {
+      const o = ours.replace(/\s+$/, '');
+      const t = theirs.replace(/\s+$/, '');
+      if (!o || !t) return (o || t) + eol;
+      return (o.endsWith(',') ? o : `${o},`) + eol + t + eol;
+    },
+  );
+}
 
 function apply(base, ours, theirs, path, conflicts) {
   const out = {};
@@ -79,6 +98,11 @@ for (const file of files) {
   const eol = theirsRaw.includes('\r\n') ? '\r\n' : '\n';
   let text = JSON.stringify(merged, null, 2).replace(/\n/g, eol);
   if (/\r?\n$/.test(theirsRaw)) text += eol;
+  try {
+    const current = readFileSync(file, 'utf8');
+    const candidate = unionConflictBlocks(current, eol) ?? current;
+    if (canonical(JSON.parse(candidate)) === canonical(merged)) text = candidate;
+  } catch { /* missing or not valid JSON: keep the by-key merge */ }
   writeFileSync(file, text);
   if (conflicts.length) {
     console.error(`${file}: changed on both sides: ${conflicts.join(', ')}`);
