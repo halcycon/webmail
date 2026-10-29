@@ -56,7 +56,7 @@ RUN apk upgrade --no-cache && \
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
-RUN mkdir -p /app/.next/cache /app/data/settings /app/data/admin /app/data/admin-state /app/data/telemetry && \
+RUN mkdir -p /app/.next/cache /app/data/settings /app/data/signatures /app/data/admin /app/data/admin-state /app/data/telemetry && \
     chown -R nextjs:nodejs /app/.next/cache /app/data
 USER nextjs
 EXPOSE 3000
